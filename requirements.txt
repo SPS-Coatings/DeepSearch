@@ -4,3 +4,4 @@ streamlit
 composio-agno
 together
 openai
+composio_openai
