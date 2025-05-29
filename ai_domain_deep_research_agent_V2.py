@@ -516,26 +516,23 @@
 
 
 
-
-# ai_deepresearch_agent.py  – RUN THIS WITH:  streamlit run ai_deepresearch_agent.py
+# ai_deepresearch_agent.py  –  run with:  streamlit run ai_deepresearch_agent.py
 import os
 import uuid
-import asyncio
 import streamlit as st
 from dotenv import load_dotenv
 
-# ─ Composio / Agno imports
 from agno.agent import Agent
-from composio_openai import ComposioToolSet, Action      # ← composio_openai for OpenAI/Agno
 from agno.models.together import Together
+from composio_openai import ComposioToolSet, Action
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Load .env values early (if running locally)
+#  .env
 # ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Streamlit page config
+#  Streamlit page
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="AI DeepResearch Agent",
@@ -545,170 +542,136 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Sidebar – API keys, OAuth connect buttons, info panes
+#  Sidebar – keys & status
 # ─────────────────────────────────────────────────────────────────────────────
-st.sidebar.header("⚙️ Configuration")
+st.sidebar.header("⚙️  Keys & Integrations")
 
 together_api_key = st.sidebar.text_input(
     "Together AI API Key",
     value=os.getenv("TOGETHER_API_KEY", ""),
-    type="password",
-    help="Get your LLM key from https://platform.together.ai"
+    type="password"
 )
-
 composio_api_key = st.sidebar.text_input(
     "Composio API Key",
     value=os.getenv("COMPOSIO_API_KEY", ""),
-    type="password",
-    help="Dashboard → Settings → API Key"
+    type="password"
 )
-
 perplexity_api_key = st.sidebar.text_input(
     "Perplexity API Key",
     value=os.getenv("PERPLEXITY_API_KEY", ""),
-    type="password",
-    help="Create at https://www.perplexity.ai (if required for API access)"
+    type="password"
 )
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### Connected Accounts")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Session state initialisation
+#  Session state
 # ─────────────────────────────────────────────────────────────────────────────
 if "entity_id" not in st.session_state:
-    # new session → generate a uuid that identifies THIS browser tab to Composio
     st.session_state.entity_id = str(uuid.uuid4())
 
-for key, default in {
-    "questions": [], 
-    "question_answers": [], 
-    "report_content": "", 
+for k, v in {
+    "googledocs_connected": False,
+    "perplexity_connected": False,
+    "questions": [],
+    "question_answers": [],
+    "report_content": "",
     "research_complete": False,
-    "googledocs_connected": False, 
-    "perplexity_connected": False
 }.items():
-    st.session_state.setdefault(key, default)
+    st.session_state.setdefault(k, v)
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Helper : initialise Composio & LLM
+#  Initialise Composio + LLM
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
-def initialize_toolset(composio_key: str):
-    # Construct the ToolSet once per process (re-used between reruns)
-    return ComposioToolSet(api_key=composio_key)
+def get_toolset(api_key: str) -> ComposioToolSet:
+    return ComposioToolSet(api_key=api_key)
 
-def initialize_llm(together_key: str):
-    return Together(
-        id="Qwen/Qwen3-235B-A22B-fp8-tput", 
-        api_key=together_key
-    )
+def get_llm(api_key: str) -> Together:
+    return Together(id="Qwen/Qwen3-235B-A22B-fp8-tput", api_key=api_key)
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  OAuth helpers
-# ─────────────────────────────────────────────────────────────────────────────
-GOOGLE_DOCS_INTEGRATION_ID = os.getenv("COMPOSIO_GOOGLEDOCS_INTEGRATION_ID", "7c6310d6-5a4d-410a-a991-7d098b36aa9e")
-PERPLEXITY_INTEGRATION_ID  = os.getenv("COMPOSIO_PERPLEXITY_INTEGRATION_ID", "6f5ad085-2009-47a8-aa55-aeadba0f030f")
-
-def connect_google_docs(toolset: ComposioToolSet, entity_id: str):
-    """
-    Start + wait for OAuth on Google Docs.
-    Returns True if connection active, else False.
-    """
-    try:
-        conn_req = toolset.initiate_connection(
-            integration_id=GOOGLE_DOCS_INTEGRATION_ID,
-            entity_id=entity_id
-        )
-    except Exception as e:
-        st.error(f"❌ Could not start Google OAuth: {e}")
-        return False
-
-    if not conn_req.redirectUrl:
-        st.error("❌ No redirect URL returned. Check your integration ID.")
-        return False
-
-    st.markdown(f"[Click here to authorise Google Docs]({conn_req.redirectUrl})")
-    with st.spinner("Waiting for you to finish Google authorisation…"):
-        try:
-            _ = conn_req.wait_until_active(
-                client=toolset.client,
-                timeout=180  # seconds
-            )
-        except Exception as e:
-            st.error(f"❌ Authorisation not completed: {e}")
-            return False
-
-    st.success("✅ Google Docs connected!")
-    return True
-
-def connect_perplexity(toolset: ComposioToolSet, entity_id: str, api_key: str):
-    """
-    Store the user's Perplexity API key as an API_TOKEN connection in Composio.
-    Returns True if stored, else False.
-    """
-    try:
-        conn_req = toolset.initiate_connection(
-            integration_id=PERPLEXITY_INTEGRATION_ID,
-            entity_id=entity_id,
-            token=api_key  # Composio will create / update the token connection
-        )
-        conn_req.wait_until_active(toolset.client, timeout=30)
-    except Exception as e:
-        st.error(f"❌ Perplexity key not accepted: {e}")
-        return False
-
-    st.success("✅ Perplexity connected!")
-    return True
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Top-level app title
-# ─────────────────────────────────────────────────────────────────────────────
-st.title("🔍 AI DeepResearch Agent")
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Initialise Composio + LLM once credentials are present
-# ─────────────────────────────────────────────────────────────────────────────
-toolset: ComposioToolSet | None = None
-llm = None
-if together_api_key and composio_api_key:
-    toolset = initialize_toolset(composio_api_key)
-    llm = initialize_llm(together_api_key)
-else:
-    st.warning("Enter Composio & Together AI keys to begin.")
+if not (together_api_key and composio_api_key):
+    st.warning("Enter both Together AI and Composio API keys to continue.")
     st.stop()
 
+toolset = get_toolset(composio_api_key)
+llm = get_llm(together_api_key)
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  OAuth / connection UI
+#  IDs of the two dashboard integrations you created earlier
+# ─────────────────────────────────────────────────────────────────────────────
+GOOGLEDOCS_INTEGRATION_ID   = os.getenv("COMPOSIO_GOOGLEDOCS_INTEGRATION_ID", "ac_iowEpJV9xQVo")
+PERPLEXITY_INTEGRATION_ID   = os.getenv("COMPOSIO_PERPLEXITY_INTEGRATION_ID", "ac_i-K3yDdWz_4C")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  OAuth helper (Google Docs)
+# ─────────────────────────────────────────────────────────────────────────────
+def connect_google_docs():
+    try:
+        req = toolset.initiate_connection(
+            integration_id=GOOGLEDOCS_INTEGRATION_ID,
+            entity_id=st.session_state.entity_id
+        )
+    except Exception as e:
+        st.error(f"Could not start Google OAuth: {e}")
+        return False
+
+    st.markdown(f"[Click here to authorise Google Docs]({req.redirectUrl})")
+    with st.spinner("Waiting for Google consent…"):
+        try:
+            req.wait_until_active(client=toolset.client, timeout=180)
+        except Exception as e:
+            st.error(f"Authorisation failed: {e}")
+            return False
+    st.success("Google Docs connected ✓")
+    return True
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  **NEW** helper for Perplexity (API-Key auth)
+# ─────────────────────────────────────────────────────────────────────────────
+def connect_perplexity(user_key: str):
+    try:
+        req = toolset.initiate_connection(
+            integration_id=PERPLEXITY_INTEGRATION_ID,
+            entity_id=st.session_state.entity_id,
+            auth_scheme="API_KEY",               # token-style auth
+            connected_account_params={           # field names come from `get_expected_params_for_user`
+                "api_key": user_key
+            }
+        )
+        # Key apps activate instantly; no redirect
+        if req.connectionStatus != "ACTIVE":
+            req.wait_until_active(client=toolset.client, timeout=30)
+    except Exception as e:
+        st.error(f"Perplexity connection failed: {e}")
+        return False
+
+    st.success("Perplexity connected ✓")
+    return True
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Sidebar buttons
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     if not st.session_state.googledocs_connected:
         if st.button("Connect Google Docs", use_container_width=True):
-            st.session_state.googledocs_connected = connect_google_docs(
-                toolset, st.session_state.entity_id
-            )
+            st.session_state.googledocs_connected = connect_google_docs()
     else:
         st.success("Google Docs ✔️")
 
     if not st.session_state.perplexity_connected:
-        if perplexity_api_key and st.button("Save Perplexity API key", use_container_width=True):
-            st.session_state.perplexity_connected = connect_perplexity(
-                toolset, st.session_state.entity_id, perplexity_api_key
-            )
+        if perplexity_api_key and st.button("Save Perplexity Key", use_container_width=True):
+            st.session_state.perplexity_connected = connect_perplexity(perplexity_api_key)
     else:
         st.success("Perplexity ✔️")
 
-# Disable rest of app until integrations ready
-integrations_ready = (
-    st.session_state.googledocs_connected and
-    st.session_state.perplexity_connected
-)
-if not integrations_ready:
-    st.info("⚠️ Connect both integrations first.")
+if not (st.session_state.googledocs_connected and st.session_state.perplexity_connected):
+    st.info("Connect both integrations first.")
     st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Fetch the three Composio tools we need *after* connections are active
+#  Fetch the three tools *after* connections are active
 # ─────────────────────────────────────────────────────────────────────────────
 composio_tools = toolset.get_tools(actions=[
     Action.COMPOSIO_SEARCH_TAVILY_SEARCH,
@@ -717,7 +680,7 @@ composio_tools = toolset.get_tools(actions=[
 ])
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Helper functions for question generation, answering, compiling
+#  Helper functions  (unchanged from previous version)
 # ─────────────────────────────────────────────────────────────────────────────
 def create_question_generator():
     return Agent(
@@ -731,19 +694,17 @@ def create_question_generator():
     )
 
 def extract_questions(text: str) -> list[str]:
-    """Strip any internal <think>…</think> tags and return lines."""
     if "</think>" in text:
         text = text.split("</think>", 1)[1]
     return [q.strip() for q in text.strip().splitlines() if q.strip()]
 
 def generate_questions(topic: str, domain: str):
-    with st.spinner("🤖 Generating research questions…"):
+    with st.spinner("🤖 Generating questions…"):
         agent = create_question_generator()
         resp = agent.run(f"Generate exactly 5 specific yes/no research questions about '{topic}' in '{domain}'.")
     st.session_state.questions = extract_questions(resp.content)
 
 def answer_question(topic: str, domain: str, question: str) -> str:
-    """Ask Perplexity & Tavily via Composio and return an answer."""
     research_agent = Agent(
         model=llm,
         tools=[composio_tools],
@@ -751,93 +712,76 @@ def answer_question(topic: str, domain: str, question: str) -> str:
             f"You are a sophisticated research assistant. Answer the question below about '{topic}' in '{domain}'.\n"
             f"Question: {question}\n"
             "Use PERPLEXITYAI_PERPLEXITY_AI_SEARCH and COMPOSIO_SEARCH_TAVILY_SEARCH for sources. "
-            "Return a concise answer with cited sources."
+            "Return a concise answer with citations."
         )
     )
-    try:
-        result = research_agent.run()
-        return result.content
-    except Exception as e:
-        # Most likely cause is missing/expired integration
-        st.error(f"Composio tool error: {e}")
-        st.stop()
+    return research_agent.run().content
 
 def compile_report(topic: str, domain: str):
     qa_sections = "\n".join(
         f"<h2>{i+1}. {qa['question']}</h2>\n<p>{qa['answer']}</p>"
         for i, qa in enumerate(st.session_state.question_answers)
     )
-
     compiler = Agent(
         name="Report Compiler",
         model=llm,
         tools=[composio_tools],
         instructions=(
-            "Compile the research findings into a professional, McKinsey-style report in HTML, "
-            "then call GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN to save it in the user’s Google Drive.\n\n"
-            "Structure:\n"
-            "1. Executive Summary / Introduction\n"
-            "2. Research Analysis – narrative paragraphs (not Q&A)\n"
-            "3. Conclusion / Implications\n\n"
+            "Compile the findings into a professional, McKinsey-style report in HTML, "
+            "then call GOOGLEDOCS_CREATE_DOCUMENT_MARKDOWN to save it to Google Drive.\n\n"
             f"Topic: {topic}\nDomain: {domain}\n\n"
-            f"Research findings:\n{qa_sections}\n"
-            "DO NOT print the raw HTML – call the Google Docs tool."
+            f"Findings:\n{qa_sections}"
         )
     )
-
-    with st.spinner("📝 Compiling report & creating Google Doc…"):
-        try:
-            result = compiler.run()
-            st.session_state.report_content = result.content
-            st.session_state.research_complete = True
-        except Exception as e:
-            st.error(f"Could not compile report: {e}")
-            st.stop()
+    with st.spinner("📝 Compiling HTML & creating Google Doc…"):
+        st.session_state.report_content = compiler.run().content
+        st.session_state.research_complete = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  UI – Topic/domain form
+#  UI — Topic & Domain
 # ─────────────────────────────────────────────────────────────────────────────
+st.title("🔍 AI DeepResearch Agent")
+
 st.header("Research Topic")
 
-col1, col2 = st.columns(2)
-with col1:
-    topic = st.text_input("Topic to research", placeholder="American tariffs")
-with col2:
+c1, c2 = st.columns(2)
+with c1:
+    topic  = st.text_input("Topic",  placeholder="American tariffs")
+with c2:
     domain = st.text_input("Domain", placeholder="Politics, Economics, Technology…")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Buttons: generate questions, start research, compile report
+#  Workflow buttons
 # ─────────────────────────────────────────────────────────────────────────────
 if topic and domain and st.button("Generate Research Questions"):
     generate_questions(topic, domain)
 
 if st.session_state.questions:
-    st.header("Research Questions")
+    st.header("Questions")
     for i, q in enumerate(st.session_state.questions, 1):
         st.markdown(f"**{i}. {q}**")
 
     if st.button("Start Research"):
         st.header("Research Results")
-        progress = st.progress(0.0)
+        prog = st.progress(0.0)
         answers = []
         for i, q in enumerate(st.session_state.questions, 1):
-            progress.progress((i - 1) / len(st.session_state.questions))
-            with st.spinner(f"🔍 Researching Q{i}…"):
+            prog.progress((i-1)/len(st.session_state.questions))
+            with st.spinner(f"Researching Q{i}…"):
                 ans = answer_question(topic, domain, q)
             answers.append({"question": q, "answer": ans})
             st.subheader(f"Q{i}: {q}")
             st.markdown(ans)
-            progress.progress(i / len(st.session_state.questions))
-
+            prog.progress(i/len(st.session_state.questions))
         st.session_state.question_answers = answers
 
     if st.session_state.question_answers and st.button("Compile Final Report"):
         compile_report(topic, domain)
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Display final report link / content
+#  Show final result
 # ─────────────────────────────────────────────────────────────────────────────
 if st.session_state.research_complete:
-    st.success("✅ Report saved to your Google Drive!")
-    with st.expander("HTML that was sent to Google Docs"):
+    st.success("Report saved to Google Docs!")
+    with st.expander("HTML sent to Docs"):
         st.markdown(st.session_state.report_content, unsafe_allow_html=True)
